@@ -1,0 +1,153 @@
+name: build
+
+# Builds Half-Life: Decay's Linux game libraries from FWGS/hlsdk-portable (branch
+# decay-pc) and publishes them as a release, so people do not have to compile them.
+#
+# The build runs in a Debian bookworm i386 container on purpose. Building on a modern
+# host produces symbols like acosf@GLIBC_2.43, which a Steam Deck (glibc 2.41) cannot
+# resolve: the libraries load nowhere, silently. Bookworm's glibc 2.36 caps the
+# requirement low enough for any current distro, and the check below enforces it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    # Monday 04:17 UTC. FWGS merge master into decay-pc periodically; this keeps the
+    # published binaries current without anyone remembering to press a button.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign the provenance attestation
+  attestations: write
+
+env:
+  UPSTREAM: https://github.com/FWGS/hlsdk-portable
+  BRANCH: decay-pc
+  # Highest GLIBC_ symbol version the output is allowed to require.
+  MAX_GLIBC: "2.36"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream commit
+        id: up
+        run: |
+          sha=$(git ls-remote "$UPSTREAM" "$BRANCH" | cut -f1)
+          [ -n "$sha" ] || { echo "could not resolve $BRANCH"; exit 1; }
+          echo "sha=$sha"        >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Upstream $BRANCH is at $sha"
+
+      - name: Skip if this commit is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "upstream-${{ steps.up.outputs.short }}" >/dev/null 2>&1; then
+            echo "Already released; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build in a 32-bit, old-glibc container
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/w" -w /w i386/debian:bookworm bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq build-essential cmake git ca-certificates >/dev/null
+            git clone --depth 1 -b '"$BRANCH"' '"$UPSTREAM"' src
+            cd src
+            test "$(git rev-parse HEAD)" = "${{ steps.up.outputs.sha }}" \
+              || echo "note: upstream moved mid-build; building $(git rev-parse HEAD)"
+            git rev-parse HEAD > /w/out/UPSTREAM_SHA
+            # freevgui is a submodule; cmake fails outright without it
+            git submodule update --init --recursive --depth 1
+            cmake -S . -B build -Wno-dev -DCMAKE_BUILD_TYPE=Release \
+                  -D64BIT=OFF -DGOLDSOURCE_SUPPORT=ON
+            cmake --build build -j"$(nproc)"
+            cp build/dlls/decay.so build/cl_dll/client.so /w/out/
+          '
+          # vgui.so is deliberately not shipped: Valve supply that at the Half-Life root.
+
+      - name: Verify the output
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          fail=0
+          for f in out/decay.so out/client.so; do
+            echo "--- $f"
+
+            file -b "$f" | grep -q 'ELF 32-bit' \
+              && echo "    32-bit: yes" \
+              || { echo "    32-bit: NO"; fail=1; }
+
+            max=$(objdump -p "$f" | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "    highest glibc requirement: $max (ceiling $MAX_GLIBC)"
+            [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -1)" = "$MAX_GLIBC" ] \
+              || { echo "    TOO NEW - would not load on a Steam Deck"; fail=1; }
+          done
+
+          # the entry points the engine actually calls
+          for sym in GiveFnptrsToDll GetEntityAPI2; do
+            nm -D --defined-only out/decay.so | grep -q " $sym\$" \
+              && echo "decay.so exports $sym" || { echo "decay.so MISSING $sym"; fail=1; }
+          done
+          for sym in Initialize HUD_Init HUD_VidInit; do
+            nm -D --defined-only out/client.so | grep -q " $sym\$" \
+              && echo "client.so exports $sym" || { echo "client.so MISSING $sym"; fail=1; }
+          done
+          exit $fail
+
+      - name: Assemble release assets
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p dist/decay-linux/lib
+          cp out/decay.so out/client.so dist/decay-linux/lib/
+          cp LICENSE install.sh README.md dist/decay-linux/
+          tar czf dist/decay-linux.tar.gz -C dist decay-linux
+          cd dist && sha256sum decay-linux.tar.gz ../out/decay.so ../out/client.so \
+            | sed 's|\.\./out/||' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            out/decay.so
+            out/client.so
+            dist/decay-linux.tar.gz
+
+      - name: Publish release
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: upstream-${{ steps.up.outputs.short }}
+          name: Built from FWGS decay-pc ${{ steps.up.outputs.short }}
+          body: |
+            Linux game libraries for the Half-Life: Decay PC port.
+
+            Built from [FWGS/hlsdk-portable](${{ env.UPSTREAM }}) branch `${{ env.BRANCH }}`
+            at commit `${{ steps.up.outputs.sha }}`.
+
+            32-bit, built against glibc 2.36 so they load on SteamOS and any current distro.
+
+            **This does not include the Decay mod itself.** You need Half-Life from Steam
+            and the Decay PC port's `decay/` folder from ModDB. See the README.
+
+            Verify these files came from this workflow:
+            ```
+            gh attestation verify decay.so --repo ${{ github.repository }}
+            ```
+          files: |
+            out/decay.so
+            out/client.so
+            dist/decay-linux.tar.gz
+            dist/SHA256SUMS

@@ -51,7 +51,7 @@ here. Every release is built by a public GitHub Actions run from public source, 
 artifacts carry a signed provenance attestation:
 
 ```
-gh attestation verify decay.so --repo OWNER/REPO
+gh attestation verify decay.so --repo ranting-soberly/decay-linux
 ```
 
 That checks these exact bytes came from this repository's workflow, from the upstream
